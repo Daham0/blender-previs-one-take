@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>白模运镜预演 · Three.js 降级方案</title>
+<style>
+  html,body{margin:0;height:100%;background:#111;color:#ddd;font:13px/1.6 system-ui,"Microsoft YaHei",sans-serif;overflow:hidden}
+  #c{display:block;width:100%;height:100%}
+  #ui{position:fixed;left:12px;top:12px;width:280px;background:rgba(20,20,20,.88);border:1px solid #333;border-radius:8px;padding:10px 12px;max-height:94vh;overflow:auto}
+  #ui h3{margin:2px 0 8px;font-size:13px;color:#7ec8ff;font-weight:600}
+  #ui label{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:4px 0;font-size:12px;color:#aaa}
+  #ui input[type=number]{width:74px;background:#000;color:#7ec8ff;border:1px solid #333;border-radius:4px;padding:2px 4px;font-size:12px}
+  #ui button{background:#1e2a33;color:#9fd8ff;border:1px solid #2f4654;border-radius:4px;padding:5px 8px;margin:4px 4px 0 0;cursor:pointer;font-size:12px}
+  #ui button:hover{background:#26363f}
+  #ui .row{border-top:1px solid #262626;margin-top:8px;padding-top:8px}
+  #hint{position:fixed;right:12px;bottom:12px;color:#666;font-size:12px;text-align:right}
+  #rec{color:#f66}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <h3>白模运镜预演（仅校验运动）</h3>
+  <label>时长 s <input id="dur" type="number" value="10" step="0.5" min="1"></label>
+  <label>帧率 <input id="fps" type="number" value="24" min="12"></label>
+  <label>极角起 <input id="a0" type="number" value="186" step="1"></label>
+  <label>极角止 <input id="a1" type="number" value="300" step="1"></label>
+  <label>半径起 <input id="r0" type="number" value="3.45" step="0.05"></label>
+  <label>半径止 <input id="r1" type="number" value="2.45" step="0.05"></label>
+  <label>机位高起 <input id="z0" type="number" value="0.78" step="0.01"></label>
+  <label>机位高止 <input id="z1" type="number" value="1.20" step="0.01"></label>
+  <label>注视高起 <input id="l0" type="number" value="1.12" step="0.01"></label>
+  <label>注视高止 <input id="l1" type="number" value="1.54" step="0.01"></label>
+  <label>视场角° <input id="fov" type="number" value="62" step="1"></label>
+  <div class="row">
+    <button id="play">播放 / 暂停</button>
+    <button id="top">顶视轨迹</button>
+    <button id="reset">复位视角</button>
+    <button id="json">导出 JSON</button>
+    <button id="recBtn">录制 webm</button>
+  </div>
+  <div class="row" style="font-size:12px;color:#777">
+    原点在地面中心，1 单位 = 1 米，z 向上。极角由 atan2(y-yc, x-xc) 定义，逆时针为正。
+  </div>
+</div>
+<div id="hint">白模只用来验证运动方向、构图与时序，<b>不作为画面参考</b></div>
+
+<script type="importmap">
+{"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js"}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({canvas, antialias:true, preserveDrawingBuffer:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x141414);
+scene.fog = new THREE.Fog(0x141414, 12, 26);
+
+// 相机（透视，用于播放）；另建正交相机用于顶视
+const cam = new THREE.PerspectiveCamera(62, 16/9, 0.05, 100);
+const camTop = new THREE.OrthographicCamera(-5,5,5,-5,0.1,50);
+camTop.position.set(0.0, 0.0, 12);
+camTop.lookAt(0,0,0);
+
+// 灯光
+scene.add(new THREE.HemisphereLight(0xffffff,0x333333,1.1));
+const dir = new THREE.DirectionalLight(0xffffff,1.0); dir.position.set(3,6,4); scene.add(dir);
+const dir2 = new THREE.DirectionalLight(0xffffff,0.5); dir2.position.set(-4,3,-5); scene.add(dir2);
+
+// 坐标系：three 默认 y 向上。为与本技能约定一致（z 向上），把整个场景容器旋转
+const W = new THREE.Group(); W.rotation.x = -Math.PI/2; scene.add(W);
+// 现在容器内：x, y（对应世界 y→屏幕纵深）, z（向上）；下面所有坐标按 z-向上 书写
+
+const matWall = new THREE.MeshStandardMaterial({color:0xf2f2f2, roughness:1, metalness:0, transparent:true, opacity:0.10, side:THREE.DoubleSide});
+const matObj  = new THREE.MeshStandardMaterial({color:0xd9d9d9, roughness:0.95, metalness:0});
+const matDark = new THREE.MeshStandardMaterial({color:0xbfbfbf, roughness:0.9, metalness:0});
+const matPerson = new THREE.MeshStandardMaterial({color:0xc9c9c9, roughness:0.95, metalness:0});
+
+function box(w,h,d,x,y,z,mat){
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w,d,h), mat||matObj); // 注意容器内 z 向上
+  m.position.set(x,y,z); return m;
+}
+function sph(r,x,y,z,mat){
+  const m = new THREE.Mesh(new THREE.SphereGeometry(r,20,16), mat||matObj);
+  m.position.set(x,y,z); return m;
+}
+
+// ---------- 房间 6.80 x 6.40 x 2.75，原点在地面中心 ----------
+const ROOM = {L:6.8, W:6.4, H:2.75};
+const roomG = new THREE.Group(); W.add(roomG);
+const floor = box(ROOM.L, ROOM.W, 0.02, 0, 0, 0, new THREE.MeshStandardMaterial({color:0xe8dcc8, roughness:1}));
+roomG.add(floor);
+const grid = new THREE.GridHelper(ROOM.L, Math.round(ROOM.L), 0x3a3a3a, 0x262626); grid.rotation.x = Math.PI/2; grid.position.y = 0.011; roomG.add(grid);
+roomG.add(box(ROOM.L, 0.02, ROOM.H, 0, ROOM.W/2, ROOM.H/2, matWall));
+roomG.add(box(ROOM.L, 0.02, ROOM.H, 0, -ROOM.W/2, ROOM.H/2, matWall));
+roomG.add(box(0.02, ROOM.W, ROOM.H, -ROOM.L/2, 0, ROOM.H/2, matWall));
+roomG.add(box(0.02, ROOM.W, ROOM.H, ROOM.L/2, 0, ROOM.H/2, matWall));
+roomG.add(box(ROOM.L, ROOM.W, 0.02, 0, 0, ROOM.H, matWall)); // 天花板
+// 左墙百叶窗
+for(let i=0;i<6;i++) roomG.add(box(0.06, 2.4, 0.06, -ROOM.L/2+0.09, 0.4, 1.0+i*0.22, matDark));
+
+// ---------- 主体组（会离地的一整组） ----------
+const movers = [];
+function mover(name, mesh, opt){
+  mesh.name = name;
+  movers.push(Object.assign({mesh, base:mesh.position.clone(), start:0, end:0, rise:0}, opt||{}));
+  W.add(mesh);
+  return mesh;
+}
+
+// 桌（桌高 0.75）
+const DESK = {x:0.0, y:0.7, h:0.725, w:2.4, d:0.9};
+mover('Desk_Top', box(DESK.w, DESK.d, 0.06, DESK.x, DESK.y, DESK.h), {start:5.50, end:9.50, rise:1.18});
+for(const [dx,dy] of [[-1,-1],[1,-1],[-1,1],[1,1]]){
+  mover('Desk_Leg', box(0.06,0.06,DESK.h, DESK.x+dx*(DESK.w/2-0.08), DESK.y+dy*(DESK.d/2-0.08), DESK.h/2), {start:5.50, end:9.50, rise:1.18});
+}
+// 双屏 / 机箱 / 键鼠
+mover('Monitor_H', box(0.62,0.03,0.36, DESK.x-0.35, DESK.y+0.12, DESK.h+0.42), {start:2.46, end:4.25, rise:1.27});
+mover('Monitor_V', box(0.34,0.03,0.60, DESK.x+0.32, DESK.y+0.12, DESK.h+0.45), {start:2.79, end:4.58, rise:1.27});
+mover('Monitor_H_Stand', box(0.06,0.06,0.20, DESK.x-0.35, DESK.y+0.16, DESK.h+0.20), {start:2.46, end:4.25, rise:1.27});
+mover('Monitor_V_Stand', box(0.06,0.06,0.20, DESK.x+0.32, DESK.y+0.16, DESK.h+0.20), {start:2.79, end:4.58, rise:1.27});
+mover('PC_Case', box(0.22,0.45,0.48, DESK.x-1.05, DESK.y+0.10, DESK.h+0.24), {start:3.29, end:5.08, rise:1.29});
+mover('Keyboard', box(0.45,0.15,0.03, DESK.x-0.02, DESK.y-0.18, DESK.h+0.035), {start:3.29, end:5.08, rise:1.29});
+mover('Mouse', box(0.06,0.10,0.03, DESK.x+0.30, DESK.y-0.18, DESK.h+0.03), {start:3.29, end:5.08, rise:1.29});
+mover('MousePad', box(0.30,0.24,0.01, DESK.x+0.26, DESK.y-0.18, DESK.h+0.012), {start:3.29, end:5.08, rise:1.29});
+
+// 椅（坐面 0.455，升空前水平后退 0.42）
+const CHAIR = {x:0.0, y:-0.55, seat:0.455};
+const chairG = new THREE.Group(); chairG.position.set(CHAIR.x, CHAIR.y, 0);
+const seat = box(0.50,0.50,0.09, 0,0,CHAIR.seat, matDark);
+const back = box(0.48,0.08,0.55, 0,-0.26,CHAIR.seat+0.34, matDark);
+const post = box(0.08,0.08,CHAIR.seat, 0,0,CHAIR.seat/2, matDark);
+const cbase = box(0.55,0.55,0.05, 0,0,0.05, matDark);
+[seat,back,post,cbase].forEach(m=>chairG.add(m));
+mover('Chair', chairG, {start:7.83, end:9.58, rise:1.08, backOff:0.42});
+
+// 人物（坐姿，朝 +y，背对左侧机位）
+const PER = {x:0.0, y:-0.42, seat:0.455};
+const personG = new THREE.Group(); personG.position.set(PER.x, PER.y, 0);
+personG.add(box(0.40,0.24,0.55, 0,0,PER.seat+0.42, matPerson));             // 躯干
+personG.add(sph(0.13, 0,0,PER.seat+0.80, matPerson));                        // 头
+personG.add(box(0.26,0.26,0.06, 0,0,PER.seat+0.92, matDark));                // 帽
+for(const sx of [-0.24, 0.24]){
+  personG.add(box(0.10,0.10,0.34, sx, 0, PER.seat+0.48, matPerson));          // 上臂
+  personG.add(box(0.09,0.09,0.32, sx*0.9, 0.22, PER.seat+0.30, matPerson));   // 前臂
+  personG.add(box(0.14,0.44,0.14, sx*0.5, 0.20, PER.seat+0.02, matPerson));   // 大腿
+  personG.add(box(0.12,0.12,PER.seat, sx*0.5, 0.38, PER.seat/2, matPerson));  // 小腿
+  personG.add(box(0.12,0.24,0.08, sx*0.5, 0.44, 0.05, matDark));              // 鞋
+}
+mover('Person', personG, {start:5.46, end:9.50, rise:1.23});
+
+// 置物架与小摆件（最轻，最早起飞）
+const SHELF = {x:1.6, y:1.6};
+for(let i=0;i<3;i++){
+  const b = box(0.9,0.32,0.04, SHELF.x, SHELF.y, 0.6+i*0.55, matDark);
+  W.add(b); // 架子本体视为静态（也可改成 mover）
+}
+for(let i=0;i<3;i++){
+  mover('Minion_'+(i+1), sph(0.07, SHELF.x-0.25+i*0.25, SHELF.y, 0.78), {start:1.58, end:3.46, rise:0.58});
+}
+
+// ---------- 轨迹可视化 ----------
+const trailPts = [];
+const trail = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineDashedMaterial({color:0x7ec8ff, dashSize:0.12, gapSize:0.08}));
+W.add(trail);
+const lookMarker = new THREE.Mesh(new THREE.SphereGeometry(0.05,12,10), new THREE.MeshBasicMaterial({color:0xff8844}));
+W.add(lookMarker);
+
+// ---------- 参数与求值 ----------
+const P = {dur:10, fps:24, a0:186, a1:300, r0:3.45, r1:2.45, z0:0.78, z1:1.20, l0:1.12, l1:1.54, fov:62,
+           center:{x:0.0, y:0.15}  // 环绕圆心，务必落在主体上};
+const el = id => document.getElementById(id);
+['dur','fps','a0','a1','r0','r1','z0','z1','l0','l1','fov'].forEach(k=>{
+  el(k).addEventListener('change', ()=>{ P[k] = parseFloat(el(k).value) || 0; rebuildTrail(); });
+});
+
+const ease = u => u<0.5 ? 2*u*u : 1-Math.pow(-2*u+2,2)/2; // ease-in-out
+const clamp01 = v => Math.max(0, Math.min(1, v));
+
+function camStateAt(t){
+  const u = clamp01(t / Math.max(1e-6, P.dur));
+  const ang = THREE.MathUtils.degToRad(P.a0 + (P.a1 - P.a0) * u);
+  const rad = P.r0 + (P.r1 - P.r0) * u;
+  const cz  = P.z0 + (P.z1 - P.z0) * u;
+  const lz  = P.l0 + (P.l1 - P.l0) * u;
+  const x = P.center.x + rad*Math.cos(ang);
+  const y = P.center.y + rad*Math.sin(ang);
+  const pitch = Math.atan2(lz - cz, rad); // 正=仰视
+  return {t, pos:new THREE.Vector3(x,y,cz), look:new THREE.Vector3(P.center.x, P.center.y, lz),
+          rad, angDeg:THREE.MathUtils.radToDeg(ang), pitchDeg:THREE.MathUtils.radToDeg(pitch), cz, lz};
+}
+
+function rebuildTrail(){
+  const pts=[];
+  for(let i=0;i<=120;i++){
+    const s = camStateAt(P.dur*i/120);
+    pts.push(s.pos.clone());
+  }
+  trail.geometry.dispose();
+  trail.geometry = new THREE.BufferGeometry().setFromPoints(pts);
+  trail.computeLineDistances();
+}
+
+function applyMovers(t){
+  for(const m of movers){
+    const u = clamp01((t - m.start) / Math.max(1e-6, m.end - m.start));
+    const e = m.end <= m.start ? (t >= m.start ? 1 : 0) : ease(u);
+    m.mesh.position.z = m.base.z + (m.rise || 0) * e;
+    if(m.backOff){
+      const bu = clamp01((t - (m.start - 0.6)) / 0.6);
+      m.mesh.position.y = m.base.y - m.backOff * ease(bu);
+    }
+  }
+}
+
+// ---------- 播放控制 ----------
+let playing = true, t = 0, last = performance.now(), topView = false;
+function resize(){
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w,h,false);
+  cam.aspect = w/h; cam.updateProjectionMatrix();
+  const s = 4.2;
+  camTop.left=-s*cam.aspect; camTop.right=s*cam.aspect; camTop.top=s; camTop.bottom=-s; camTop.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+
+function tick(now){
+  const dt = (now - last)/1000; last = now;
+  if(playing){ t = (t + dt) % P.dur; }
+  const s = camStateAt(t);
+  cam.fov = P.fov; cam.updateProjectionMatrix();
+  // three 中 y 向上，场景容器已旋转：世界点 (x,y,z) → three 坐标 (x, z, -y)
+  const toThree = p => new THREE.Vector3(p.x, p.z, -p.y);
+  const cpos = toThree(s.pos), clook = toThree(s.look);
+  if(!topView){
+    cam.position.copy(cpos); cam.lookAt(clook);
+    renderer.render(scene, cam);
+  }else{
+    camTop.position.set(P.center.x, 12, -P.center.y);
+    camTop.up.set(0,0,-1);
+    camTop.lookAt(P.center.x, 0, -P.center.y);
+    renderer.render(scene, camTop);
+  }
+  lookMarker.position.copy(s.look);
+  document.getElementById('hint').innerHTML =
+    `t=${t.toFixed(2)}s ｜ 极角 ${s.angDeg.toFixed(1)}° ｜ 半径 ${s.rad.toFixed(2)}m ｜ 机位高 ${s.cz.toFixed(2)}m ｜ 仰角 ${s.pitchDeg.toFixed(2)}°` +
+    `<br><span style="color:#666">白模只验证运动与构图，不作为画面参考</span>`;
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+rebuildTrail();
+
+el('play').onclick = ()=>{ playing = !playing; };
+el('top').onclick = ()=>{ topView = !topView; };
+el('reset').onclick = ()=>{ P.dur=10;P.fps=24;P.a0=186;P.a1=300;P.r0=3.45;P.r1=2.45;P.z0=0.78;P.z1=1.20;P.l0=1.12;P.l1=1.54;P.fov=62;
+  ['dur','fps','a0','a1','r0','r1','z0','z1','l0','l1','fov'].forEach(k=>el(k).value=P[k]); rebuildTrail(); };
+
+el('json').onclick = ()=>{
+  const frames = Math.round(P.dur * P.fps);
+  const rows = [];
+  for(let f=0; f<=frames; f++){
+    const tt = f / P.fps;
+    const s = camStateAt(tt);
+    const row = {f:f+1, t:+tt.toFixed(3),
+      cam:[+s.pos.x.toFixed(3), +s.pos.y.toFixed(3), +s.cz.toFixed(3)],
+      rad:+s.rad.toFixed(3), ang:+s.angDeg.toFixed(2), pitch:+s.pitchDeg.toFixed(2),
+      look:[+s.look.x.toFixed(3), +s.look.y.toFixed(3), +s.lz.toFixed(3)]};
+    for(const m of movers){
+      const u = clamp01((tt - m.start)/Math.max(1e-6, m.end-m.start));
+      const e = m.end<=m.start ? (tt>=m.start?1:0) : ease(u);
+      row[m.mesh.name] = [+(m.base.x).toFixed(3), +(m.base.y - (m.backOff? m.backOff*ease(clamp01((tt-(m.start-0.6))/0.6)) :0)).toFixed(3), +(m.base.z + (m.rise||0)*e).toFixed(3)];
+    }
+    rows.push(row);
+  }
+  const meta = {generated_by:'threejs_previs.html', unit:'meter', up_axis:'z',
+    origin:'room floor center', room:ROOM, params:{...P}, frames_count:rows.length,
+    note:'白模预演仅用于锁定运动/时序/坐标，不作为画面参考'};
+  const blob = new Blob([JSON.stringify({meta, frames:rows}, null, 1)], {type:'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'previs_cam_data.json'; a.click();
+};
+
+let recorder = null;
+el('recBtn').onclick = ()=>{
+  if(recorder && recorder.state === 'recording'){ recorder.stop(); el('recBtn').textContent='录制 webm'; return; }
+  const stream = canvas.captureStream(P.fps);
+  recorder = new MediaRecorder(stream, {mimeType:'video/webm'});
+  const chunks = [];
+  recorder.ondataavailable = e => chunks.push(e.data);
+  recorder.onstop = ()=>{
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob(chunks, {type:'video/webm'}));
+    a.download = 'previs.webm'; a.click();
+  };
+  recorder.start(); t = 0; playing = true;
+  el('recBtn').textContent = '停止录制';
+  setTimeout(()=>{ if(recorder.state==='recording'){ recorder.stop(); el('recBtn').textContent='录制 webm'; } }, P.dur*1000);
+};
+</script>
+</body>
+</html>

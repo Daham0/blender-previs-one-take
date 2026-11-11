@@ -1,0 +1,7 @@
+﻿__pycache__/
+*.pyc
+*.blend1
+previs_v*.mp4
+*.webm
+temp/
+output/
